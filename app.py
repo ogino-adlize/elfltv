@@ -184,16 +184,30 @@ def compute_cohort(df_valid: pd.DataFrame, sub_ids: tuple, max_round: int):
 
 
 def simulate_profit(
-    avg_cum_ltv, avg_cum_orders, cost_mode, cost_value, ship_cost, payment_fee_rate, target_profit_rate
+    avg_cum_ltv, avg_cum_orders, cost_mode, cost_value_first, cost_value_repeat,
+    ship_cost, payment_fee_rate, target_profit_rate,
 ):
     """
-    cost_mode: "rate"  -> cost_value は原価率(0〜1)。売上（累積LTV）に比例した原価を計算。
-               "fixed" -> cost_value は1回あたりの原価(円)。受注回数に比例した原価を計算（配送料と同じ考え方）。
+    cost_mode: "rate"  -> cost_value は原価率(0〜1)。各回の売上（受注ごとの増分LTV）に比例した原価を計算。
+               "fixed" -> cost_value は1回あたりの原価(円)。受注1回ごとに固定額の原価を計算（配送料と同じ考え方）。
+    cost_value_first / cost_value_repeat : 1回目 / 2回目以降 でそれぞれ異なる原価（率 or 円）を指定できる。
+    同じ値を渡せば「分けない」設定と同じ結果になる。
     """
-    if cost_mode == "fixed":
-        cum_cost = avg_cum_orders * cost_value
-    else:
-        cum_cost = avg_cum_ltv * cost_value
+    rounds = list(avg_cum_ltv.index)
+
+    # 各回の「増分」（その回だけの値）を算出してから、回ごとに異なる原価率/原価額を適用する
+    incremental_ltv = avg_cum_ltv.diff()
+    incremental_ltv.iloc[0] = avg_cum_ltv.iloc[0]
+    incremental_orders = avg_cum_orders.diff()
+    incremental_orders.iloc[0] = avg_cum_orders.iloc[0]
+
+    incremental_cost = pd.Series(index=rounds, dtype=float)
+    for i, r in enumerate(rounds):
+        cv = cost_value_first if r == 1 else cost_value_repeat
+        base = incremental_ltv.iloc[i] if cost_mode == "rate" else incremental_orders.iloc[i]
+        incremental_cost.iloc[i] = base * cv
+
+    cum_cost = incremental_cost.cumsum()
     cum_ship = avg_cum_orders * ship_cost
     cum_payment_fee = avg_cum_ltv * payment_fee_rate
     cum_gross_profit = avg_cum_ltv - cum_cost - cum_ship - cum_payment_fee
@@ -335,19 +349,39 @@ cost_mode_label = st.radio(
 )
 cost_mode = "fixed" if cost_mode_label.startswith("1回あたり") else "rate"
 
-c1, c2, c3, c4 = st.columns(4)
+split_cost = st.checkbox(
+    "1回目と2回目以降で原価を分けて入力する",
+    value=False,
+    help="初回は挨拶状・ブランドブック等の同梱物で原価が高く、2回目以降は本体のみで安くなる、といったケースに対応します。",
+)
+
+c1, c2, c3, c4, c5 = st.columns(5) if split_cost else (st.columns(4) + [None])
 with c1:
     if cost_mode == "rate":
-        cost_rate_pct = st.slider("商品原価率 (%)", 0.0, 100.0, 30.0, 0.5)
-        cost_value = cost_rate_pct / 100
+        cost_first_pct = st.slider("原価率 (%)（1回目）" if split_cost else "商品原価率 (%)", 0.0, 100.0, 30.0, 0.5)
+        cost_value_first = cost_first_pct / 100
     else:
-        cost_yen = st.number_input("1回あたりの原価 (円)", min_value=0, value=500, step=10)
-        cost_value = cost_yen
-with c2:
+        cost_first_yen = st.number_input("原価 (円)（1回目）" if split_cost else "1回あたりの原価 (円)", min_value=0, value=500, step=10)
+        cost_value_first = cost_first_yen
+
+if split_cost:
+    with c2:
+        if cost_mode == "rate":
+            cost_repeat_pct = st.slider("原価率 (%)（2回目以降）", 0.0, 100.0, 30.0, 0.5)
+            cost_value_repeat = cost_repeat_pct / 100
+        else:
+            cost_repeat_yen = st.number_input("原価 (円)（2回目以降）", min_value=0, value=300, step=10)
+            cost_value_repeat = cost_repeat_yen
+    col_ship, col_fee, col_target = c3, c4, c5
+else:
+    cost_value_repeat = cost_value_first
+    col_ship, col_fee, col_target = c2, c3, c4
+
+with col_ship:
     ship_cost_yen = st.number_input("1回あたりの配送料・資材費 (円)", min_value=0, value=0, step=10, help="小計に配送料が含まれておらず加味したくない場合は0円のままでOKです。")
-with c3:
+with col_fee:
     payment_fee_pct = st.slider("決済手数料 (%)", 0.0, 20.0, 0.0, 0.1, help="加味したくない場合は0%のままでOKです。")
-with c4:
+with col_target:
     target_profit_pct = st.slider("目標利益率 (%)", 0.0, 100.0, 20.0, 0.5)
 
 payment_fee_rate = payment_fee_pct / 100
@@ -391,7 +425,7 @@ max_round_global = int(valid_df[valid_df[COL_SUB_ID].isin(sub_ids)][COL_COUNT].m
 
 retention, avg_cum_ltv, avg_cum_orders, denom = compute_cohort(valid_df, sub_ids, max_round_global)
 cum_cost, cum_ship, cum_payment_fee, cum_gross_profit, target_profit, allowable_cpa = simulate_profit(
-    avg_cum_ltv, avg_cum_orders, cost_mode, cost_value, ship_cost_yen, payment_fee_rate, target_profit_rate
+    avg_cum_ltv, avg_cum_orders, cost_mode, cost_value_first, cost_value_repeat, ship_cost_yen, payment_fee_rate, target_profit_rate
 )
 
 # ---------------------------------------------------------
@@ -467,7 +501,7 @@ with tab2:
         if rank_round not in m["avg_cum_ltv"].index:
             continue
         gc, gs, gf, gp, gt, gcpa = simulate_profit(
-            m["avg_cum_ltv"], m["avg_cum_orders"], cost_mode, cost_value, ship_cost_yen, payment_fee_rate, target_profit_rate
+            m["avg_cum_ltv"], m["avg_cum_orders"], cost_mode, cost_value_first, cost_value_repeat, ship_cost_yen, payment_fee_rate, target_profit_rate
         )
         rows.append({
             ad_col_choice: g, "対象人数": m["denom"],
@@ -593,7 +627,7 @@ with tab7:
             if pm_round not in m["avg_cum_ltv"].index:
                 continue
             gc, gs, gf, gp, gt, gcpa = simulate_profit(
-                m["avg_cum_ltv"], m["avg_cum_orders"], cost_mode, cost_value, ship_cost_yen, payment_fee_rate, target_profit_rate
+                m["avg_cum_ltv"], m["avg_cum_orders"], cost_mode, cost_value_first, cost_value_repeat, ship_cost_yen, payment_fee_rate, target_profit_rate
             )
             pm_rows.append({
                 COL_PAYMENT_METHOD: g, "対象人数": m["denom"],
